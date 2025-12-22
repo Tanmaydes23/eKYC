@@ -1,0 +1,22 @@
+# Models
+*.pth
+*.h5
+*.pt
+*.onnx
+*.zip
+
+# Data
+data/
+datasets/
+
+# Kaggle
+.ipynb_checkpoints/
+.kaggle/
+
+# Python
+__pycache__/
+venv/
+env/
+
+# Secrets
+.env
