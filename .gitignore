@@ -20,3 +20,11 @@ env/
 
 # Secrets
 .env
+
+# Datasets
+Duplication_Dataset/
+Forgery_Dataset/
+weights/
+
+# Exceptions
+!liveness.h5

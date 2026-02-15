@@ -6,18 +6,19 @@ Run: streamlit run ekyc_webapp.py
 """
 
 import streamlit as st
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import cv2
 import numpy as np
+import torch
+import torch.nn as nn
 from PIL import Image
-import timm
 import insightface
 from insightface.app import FaceAnalysis
-from facenet_pytorch import MTCNN
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+import warnings
+warnings.filterwarnings('ignore')
 from pathlib import Path
 import tempfile
+from liveness_net import create_liveness_detector
 
 # =============================================================================
 # Page Configuration
@@ -72,171 +73,177 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# Model Definitions (Same as backend)
+# Model Definitions (Removed EfficientNet, using ViT from HuggingFace)
 # =============================================================================
-class DeepfakeDetectorEfficientNet(nn.Module):
-    def __init__(self, pretrained=False):
-        super().__init__()
-        self.backbone = timm.create_model('tf_efficientnet_b7_ns', pretrained=pretrained, num_classes=0, global_pool='')
-        self.feat_dim = self.backbone.num_features
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(self.feat_dim, 1)
-    
-    def forward(self, x):
-        features = self.backbone(x)
-        pooled = self.global_pool(features).flatten(1)
-        pooled = self.dropout(pooled)
-        return self.fc(pooled)
-
-class DeepfakeEnsemble(nn.Module):
-    def __init__(self, num_models=1):
-        super().__init__()
-        self.models = nn.ModuleList([DeepfakeDetectorEfficientNet(pretrained=False) for _ in range(num_models)])
-        self.weights = nn.Parameter(torch.ones(num_models) / num_models)
-    
-    def forward(self, x):
-        predictions = [model(x) for model in self.models]
-        predictions = torch.stack(predictions, dim=0)
-        weights = F.softmax(self.weights, dim=0)
-        return torch.sum(predictions * weights.view(-1, 1, 1), dim=0)
 
 # =============================================================================
 # Load Models (Cached)
 # =============================================================================
 @st.cache_resource
-def load_models():
-    """Load all models once and cache"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    with st.spinner("🔄 Loading AI models... (first time only)"):
-        # 1. Deepfake Model
-        deepfake_model = DeepfakeEnsemble(num_models=1).to(device)
-        model_path = st.session_state.get('model_path', 'best_deepfake_model.pth')
-        if Path(model_path).exists():
-            try:
-                checkpoint = torch.load(model_path, map_location=device)
-                # Handle both checkpoint dict and direct state_dict
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    deepfake_model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    deepfake_model.load_state_dict(checkpoint)
-                deepfake_model.eval()
-                st.success("✅ Deepfake model loaded successfully!")
-            except Exception as e:
-                st.error(f"❌ Error loading model: {e}")
-                deepfake_model = None
-        else:
-            st.warning("⚠️ Deepfake model not found. Upload model file in sidebar.")
-            deepfake_model = None
+def load_deepfake_model():
+    """Load ViT deepfake detection model"""
+    try:
+        st.info("📥 Loading ViT Deepfake Detector (dima806)...")
+        model_name = "dima806/deepfake_vs_real_image_detection"
         
-        # 2. InsightFace
-        face_app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        face_app.prepare(ctx_id=0 if torch.cuda.is_available() else -1, det_size=(640, 640))
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        model = AutoModelForImageClassification.from_pretrained(model_name)
+        model.eval()
         
-        # 3. MTCNN
-        mtcnn = MTCNN(image_size=224, margin=20, device=device, keep_all=False)
+        st.success("✅ ViT Deepfake Detector loaded successfully!")
+        return processor, model
+    except Exception as e:
+        st.error(f"❌ Failed to load ViT model: {e}")
+        return None, None
 
-        # 4. Liveness Detector with pretrained weights (REQUIRED)
-        global liveness_detector
-        model_path = 'minifasnet_v2.pth'
-        
+@st.cache_resource
+def load_identity_model():
+    """Load InsightFace for identity verification"""
+    with st.spinner("🔄 Loading InsightFace model..."):
         try:
-            liveness_detector = create_liveness_detector(model_path=model_path, device=device)
-            st.success("✅ Liveness model loaded successfully (MiniFASNet V2)!")
+            face_app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            face_app.prepare(ctx_id=0 if torch.cuda.is_available() else -1, det_size=(640, 640))
+            st.success("✅ InsightFace loaded successfully!")
+            return face_app
         except Exception as e:
-            st.error(f"❌ CRITICAL: Failed to load MiniFASNet V2: {str(e)}")
+            st.error(f"❌ CRITICAL: Failed to load InsightFace: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None
+
+@st.cache_resource
+def load_liveness_model():
+    """Load LivenessNet Detector"""
+    with st.spinner("🔄 Loading LivenessNet model..."):
+        liveness_model_path = 'liveness.h5'  # LivenessNet Keras model
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        try:
+            liveness_detector = create_liveness_detector(model_path=liveness_model_path, device=device)
+            st.success("✅ LivenessNet loaded successfully!")
+            return liveness_detector
+        except Exception as e:
+            st.error(f"❌ CRITICAL: Failed to load LivenessNet: {str(e)}")
             st.error(f"Error type: {type(e).__name__}")
             import traceback
             st.code(traceback.format_exc())
-            raise  # Re-raise to stop execution
-    
-    return deepfake_model, face_app, mtcnn, liveness_detector, device
+            return None  # Set to None instead of crashing
 
 # =============================================================================
 # Liveness Detection
 # =============================================================================
-from liveness_detection import create_liveness_detector
+# from liveness_net import create_liveness_detector # This import is already at the top
 
-# Global liveness detector (will be initialized in load_models)
-liveness_detector = None
-
-def detect_liveness(image, mtcnn, device):
+def detect_liveness(image, liveness_detector, face_app):
     """
     Advanced liveness detection using MiniFASNet V2 or improved texture analysis
     
     Args:
         image: PIL Image
-        mtcnn: MTCNN detector (to extract face region)
-        device: torch.device
+        liveness_detector: LivenessDetector instance from liveness_detection.py
+        face_app: InsightFace FaceAnalysis app (to extract face region)
     
     Returns:
         float: liveness score (0-1, higher = more likely live)
     """
-    global liveness_detector
     
     try:
-        # Convert to numpy
-        img = np.array(image)
-        
-        # Extract face region using MTCNN
-        face_tensor = mtcnn(img)
-        if face_tensor is None:
-            # If no face detected, use whole image
-            face_region = img
-        else:
-            # Convert tensor back to numpy for liveness detector
-            face_np = face_tensor.permute(1, 2, 0).cpu().numpy()
-            # Denormalize from [-1, 1] to [0, 255]
-            face_region = ((face_np + 1) * 127.5).astype(np.uint8)
-        
-        # Safety check
+        # Safety check first
         if liveness_detector is None:
             st.error("❌ Liveness detector not initialized!")
             return 0.5  # Neutral score
         
+        # Convert to numpy
+        img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Get face bounding box using InsightFace
+        faces = face_app.get(img_bgr)
+        
+        if not faces:
+            # If no face detected, use whole image
+            st.warning("⚠️ No face detected by InsightFace for liveness, using full image")
+            face_region = img_bgr
+        else:
+            # Get the first face bounding box
+            box = faces[0].bbox
+            x1, y1, x2, y2 = box
+            
+            # Calculate center and size
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            width = x2 - x1
+            height = y2 - y1
+            
+            # CRITICAL: Apply 2.7x scale expansion (matches model training)
+            # Model: 2.7_80x80_MiniFASNetV2.pth
+            scale = 2.7
+            new_width = width * scale
+            new_height = height * scale
+            
+            # Calculate expanded bounding box
+            exp_x1 = int(center_x - new_width / 2)
+            exp_y1 = int(center_y - new_height / 2)
+            exp_x2 = int(center_x + new_width / 2)
+            exp_y2 = int(center_y + new_height / 2)
+            
+            # Clamp to image boundaries
+            h, w = img_bgr.shape[:2]
+            exp_x1 = max(0, exp_x1)
+            exp_y1 = max(0, exp_y1)
+            exp_x2 = min(w, exp_x2)
+            exp_y2 = min(h, exp_y2)
+            
+            # Crop face region with 2.7x expansion
+            face_region = img_bgr[exp_y1:exp_y2, exp_x1:exp_x2]
+            
+            if face_region.size == 0:
+                st.warning("⚠️ Face crop resulted in empty region, using full image")
+                face_region = img_bgr
+        
         # Predict liveness
         liveness_score = liveness_detector.predict(face_region)
+        
+        # Validate score
+        if not (0 <= liveness_score <= 1):
+            st.warning(f"⚠️ Unusual liveness score: {liveness_score:.4f}, clamping to [0,1]")
+            liveness_score = max(0, min(1, liveness_score))
         
         return liveness_score
         
     except Exception as e:
-        print(f"Error in liveness detection: {e}")
-        # Fallback to very basic check
-        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return min(variance / 1000.0, 1.0)
+        st.error(f"❌ Error in liveness detection: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+        # Fallback to very basic texture check
+        try:
+            gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+            fallback_score = min(variance / 1000.0, 1.0)
+            st.info(f"🔄 Using fallback texture analysis, score: {fallback_score:.4f}")
+            return fallback_score
+        except:
+            return 0.5  # Ultimate fallback
 
 # =============================================================================
 # Verification Functions
 # =============================================================================
-def detect_deepfake(image, model, mtcnn, device):
-    """Detect if image contains deepfake"""
+def detect_deepfake(image, processor, model):
+    """Detect if image contains deepfake using ViT model"""
     try:
-        img = np.array(image)
-        face_tensor = mtcnn(img)
+        # Preprocess image
+        inputs = processor(images=image, return_tensors="pt")
         
-        if face_tensor is None:
-            return None
-        
-        # MTCNN returns normalized tensor [-1, 1], but model might expect [0, 1]
-        # Denormalize and renorm alize for the model
-        face_tensor = face_tensor.unsqueeze(0).to(device)
-        
+        # Make prediction
         with torch.no_grad():
-            logits = model(face_tensor)
-            prob = torch.sigmoid(logits).item()
+            outputs = model(**inputs)
+            logits = outputs.logits
         
-        # Check if probability is valid
-        if prob == 0.0 or not (0 <= prob <= 1):
-            # Model might not be properly trained, use random guess
-            st.warning("⚠️ Deepfake model returned invalid score, using conservative estimate")
-            authenticity_score = 0.5  # Neutral score
-        else:
-            # TEMP: Force 50% - model undertrained (2 epochs only)
-            authenticity_score = 0.5  # authenticity_score = 1 - prob
+        # Get probabilities
+        probabilities = torch.softmax(logits, dim=-1)
         
-        return authenticity_score
+        # Labels: 0 = Real, 1 = Fake (verified from model config)
+        real_prob = probabilities[0, 0].item()  # Get REAL probability
+        
+        return real_prob
     except Exception as e:
         st.error(f"Error in deepfake detection: {e}")
         return 0.5  # Neutral score on error
@@ -277,24 +284,19 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        # Model upload
-        st.subheader("📂 Model Configuration")
-        uploaded_model = st.file_uploader("Upload Deepfake Model (.pth)", type=['pth'])
-        if uploaded_model:
-            with open('best_deepfake_model.pth', 'wb') as f:
-                f.write(uploaded_model.read())
-            st.session_state['model_path'] = 'best_deepfake_model.pth'
-            st.success("✅ Model uploaded!")
+        # Model upload (removed deepfake model upload as it's from HuggingFace)
+        # The liveness model is still a local file, so we could add an uploader for it if needed.
+        # For now, assuming 'liveness.model' exists.
         
         st.markdown("---")
         
         # Thresholds
         st.subheader("🎚️ Verification Thresholds")
-        deepfake_threshold = st.slider("Deepfake Threshold", 0.0, 1.0, 0.4, 0.05,
-                                       help="Higher = stricter deepfake detection")
+        deepfake_threshold = st.slider("Deepfake Threshold (Authenticity)", 0.0, 1.0, 0.7, 0.05,
+                                       help="Higher = stricter deepfake detection (score > threshold means REAL)")
         identity_threshold = st.slider("Identity Match Threshold", 0.0, 1.0, 0.5, 0.05,
                                       help="Higher = stricter identity matching")
-        liveness_threshold = st.slider("Liveness Threshold", 0.0, 1.0, 0.2, 0.05,
+        liveness_threshold = st.slider("Liveness Threshold", 0.0, 1.0, 0.5, 0.05,
                                       help="Higher = stricter liveness detection")
         
         st.markdown("---")
@@ -306,10 +308,24 @@ def main():
         st.info("**Components:**\n- Deepfake Detection\n- Identity Verification\n- Liveness Detection")
     
     # Load models
-    deepfake_model, face_app, mtcnn, liveness_detector, device = load_models()
+    st.sidebar.header("🔧 System Status")
     
-    if deepfake_model is None:
-        st.error("❌ Please upload the deepfake model in the sidebar to continue.")
+    # Identity model
+    face_app = load_identity_model()
+    if face_app is None:
+        st.error("❌ Identity verification model failed to load. Please check logs.")
+        return
+    
+    # Liveness model  
+    liveness_detector = load_liveness_model()
+    if liveness_detector is None:
+        st.error("❌ Liveness detection model failed to load. Please check logs.")
+        return
+    
+    # Deepfake model (ViT)
+    deepfake_processor, deepfake_model = load_deepfake_model()
+    if deepfake_processor is None or deepfake_model is None:
+        st.error("❌ Deepfake detection model failed to load. Please check logs.")
         return
     
     # Main interface
@@ -343,15 +359,14 @@ def main():
             progress = st.progress(0)
             st.info("1️⃣ Checking for deepfakes...")
             
-            deepfake_id = detect_deepfake(id_img, deepfake_model, mtcnn, device)
-            deepfake_selfie = detect_deepfake(selfie_img, deepfake_model, mtcnn, device)
+            # Deepfake detection is typically applied to the selfie
+            deepfake_selfie_score = detect_deepfake(selfie_img, deepfake_processor, deepfake_model)
             
-            if deepfake_id is None or deepfake_selfie is None:
-                st.error("❌ Face not detected in one or both images!")
+            if deepfake_selfie_score is None:
+                st.error("❌ Deepfake detection failed for selfie!")
                 return
             
-            overall_authenticity = min(deepfake_id, deepfake_selfie)
-            deepfake_pass = overall_authenticity > deepfake_threshold
+            deepfake_pass = deepfake_selfie_score > deepfake_threshold
             
             progress.progress(33)
             
@@ -360,7 +375,7 @@ def main():
             identity_score = verify_identity(id_img, selfie_img, face_app)
             
             if identity_score is None:
-                st.error("❌ Could not extract face features!")
+                st.error("❌ Could not extract face features from one or both images for identity verification!")
                 return
             
             identity_pass = identity_score > identity_threshold
@@ -369,7 +384,7 @@ def main():
             
             # 3. Liveness Detection
             st.info("3️⃣ Checking liveness...")
-            liveness_score = detect_liveness(selfie_img, mtcnn,device)
+            liveness_score = detect_liveness(selfie_img, liveness_detector, face_app)
             liveness_pass = liveness_score > liveness_threshold
             
             progress.progress(100)
@@ -384,7 +399,7 @@ def main():
         
         with col1:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Deepfake Detection", f"{overall_authenticity:.1%}", 
+            st.metric("Deepfake Detection", f"{deepfake_selfie_score:.1%}", 
                      delta="✅ Pass" if deepfake_pass else "❌ Fail")
             st.markdown('</div>', unsafe_allow_html=True)
         
@@ -404,7 +419,7 @@ def main():
         
         # Final decision
         final_pass = deepfake_pass and identity_pass and liveness_pass
-        confidence = (overall_authenticity + identity_score + liveness_score) / 3
+        confidence = (deepfake_selfie_score + identity_score + liveness_score) / 3
         
         if final_pass:
             st.markdown(f'<div class="success-box">✅ VERIFICATION PASSED<br>Confidence: {confidence:.1%}</div>', 
@@ -427,9 +442,7 @@ def main():
         with st.expander("📈 Detailed Scores"):
             st.json({
                 "Deepfake Detection": {
-                    "ID Authenticity": f"{deepfake_id:.4f}",
-                    "Selfie Authenticity": f"{deepfake_selfie:.4f}",
-                    "Overall": f"{overall_authenticity:.4f}",
+                    "Selfie Authenticity": f"{deepfake_selfie_score:.4f}",
                     "Threshold": deepfake_threshold,
                     "Pass": deepfake_pass
                 },
