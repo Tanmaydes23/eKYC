@@ -86,9 +86,8 @@ C:\Kaggle\
 2. **Upload Selfie** - Recent photo of the person
 3. **Click "Verify eKYC"**
 4. **Review Results:**
-   - ✅ **PASS** - All checks passed
-   - ⚠️ **UNCERTAIN** - Manual review recommended
-   - ❌ **FAIL** - Verification failed
+   - ✅ **PASS** - All 3 checks passed (AND logic)
+   - ❌ **FAIL** - One or more checks failed
 
 ### Verification Thresholds
 
